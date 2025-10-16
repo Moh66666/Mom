@@ -1,0 +1,276 @@
+import os
+import smtplib
+import schedule
+import time
+from datetime import datetime
+from email.mime.text import MimeText
+from email.mime.multipart import MimeMultipart
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import ta
+from flask import Flask
+
+app = Flask(__name__)
+
+# إعدادات الإيميل (سيتم تعيينها في Render)
+EMAIL_CONFIG = {
+    'smtp_server': 'smtp.gmail.com',
+    'smtp_port': 587,
+    'sender_email': os.environ.get('EMAIL_SENDER', ''),
+    'sender_password': os.environ.get('EMAIL_PASSWORD', ''),
+    'receiver_email': os.environ.get('EMAIL_RECEIVER', '')
+}
+
+class AdvancedTradingSignals:
+    def __init__(self):
+        self.signals_history = []
+    
+    def calculate_indicators(self, df):
+        """حساب جميع المؤشرات الفنية"""
+        # المتوسطات المتحركة
+        df['SMA_9'] = ta.trend.sma_indicator(df['Close'], window=9)
+        df['SMA_21'] = ta.trend.sma_indicator(df['Close'], window=21)
+        df['EMA_12'] = ta.trend.ema_indicator(df['Close'], window=12)
+        df['EMA_26'] = ta.trend.ema_indicator(df['Close'], window=26)
+        
+        # RSI بمستويات متعددة
+        df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
+        df['RSI_7'] = ta.momentum.rsi(df['Close'], window=7)
+        
+        # MACD
+        macd = ta.trend.MACD(df['Close'])
+        df['MACD'] = macd.macd()
+        df['MACD_Signal'] = macd.macd_signal()
+        df['MACD_Histogram'] = macd.macd_diff()
+        
+        # Bollinger Bands
+        bollinger = ta.volatility.BollingerBands(df['Close'])
+        df['BB_Upper'] = bollinger.bollinger_hband()
+        df['BB_Lower'] = bollinger.bollinger_lband()
+        df['BB_Middle'] = bollinger.bollinger_mavg()
+        
+        # ATR
+        df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'])
+        
+        # Volume indicators
+        df['Volume_SMA'] = df['Volume'].rolling(20).mean()
+        
+        # Stochastic
+        stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'])
+        df['Stoch_K'] = stoch.stoch()
+        df['Stoch_D'] = stoch.stoch_signal()
+        
+        return df
+    
+    def analyze_signals(self, symbol="EURUSD=X", timeframe="60m"):
+        """تحليل متعدد الأبعاد للإشارات"""
+        try:
+            # جلب البيانات
+            data = yf.download(symbol, period="1mo", interval=timeframe, progress=False)
+            if data.empty:
+                return None
+            
+            df = self.calculate_indicators(data)
+            current = df.iloc[-1]
+            previous = df.iloc[-2]
+            
+            signal_strength = 0
+            confidence_reasons = []
+            
+            # 1. تحليل المتوسطات المتحركة (وزن 30%)
+            ma_signals = []
+            if current['SMA_9'] > current['SMA_21'] and previous['SMA_9'] <= previous['SMA_21']:
+                ma_signals.append("SMA 9 عبر فوق SMA 21")
+                signal_strength += 15
+            elif current['SMA_9'] < current['SMA_21'] and previous['SMA_9'] >= previous['SMA_21']:
+                ma_signals.append("SMA 9 عبر تحت SMA 21")
+                signal_strength -= 15
+            
+            if current['EMA_12'] > current['EMA_26']:
+                ma_signals.append("EMA 12 فوق EMA 26")
+                signal_strength += 10
+            else:
+                ma_signals.append("EMA 12 تحت EMA 26")
+                signal_strength -= 10
+            
+            if ma_signals:
+                confidence_reasons.extend(ma_signals)
+            
+            # 2. تحليل RSI (وزن 25%)
+            rsi_signals = []
+            if current['RSI'] < 30:
+                rsi_signals.append("RSI في منطقة ذروة البيع (<30)")
+                signal_strength += 20
+            elif current['RSI'] > 70:
+                rsi_signals.append("RSI في منطقة ذروة الشراء (>70)")
+                signal_strength -= 20
+            elif 40 < current['RSI'] < 60:
+                rsi_signals.append("RSI في منطقة محايدة")
+            
+            if rsi_signals:
+                confidence_reasons.extend(rsi_signals)
+            
+            # 3. تحليل MACD (وزن 20%)
+            if current['MACD'] > current['MACD_Signal'] and previous['MACD'] <= previous['MACD_Signal']:
+                confidence_reasons.append("MACD إيجابي")
+                signal_strength += 10
+            elif current['MACD'] < current['MACD_Signal'] and previous['MACD'] >= previous['MACD_Signal']:
+                confidence_reasons.append("MACD سلبي")
+                signal_strength -= 10
+            
+            # 4. تحليل البولينجر باند (وزن 15%)
+            if current['Close'] < current['BB_Lower']:
+                confidence_reasons.append("السعر تحت البولينجر السفلي (ذروة بيع)")
+                signal_strength += 8
+            elif current['Close'] > current['BB_Upper']:
+                confidence_reasons.append("السعر فوق البولينجر العلوي (ذروة شراء)")
+                signal_strength -= 8
+            
+            # 5. تحليل الاستوكاستك (وزن 10%)
+            if current['Stoch_K'] < 20 and current['Stoch_D'] < 20:
+                confidence_reasons.append("الاستوكاستك في منطقة ذروة البيع")
+                signal_strength += 5
+            elif current['Stoch_K'] > 80 and current['Stoch_D'] > 80:
+                confidence_reasons.append("الاستوكاستك في منطقة ذروة الشراء")
+                signal_strength -= 5
+            
+            # تحديد الإشارة النهائية
+            if signal_strength >= 20:
+                final_signal = "شراء قوي 🟢"
+            elif signal_strength >= 10:
+                final_signal = "شراء 🟢"
+            elif signal_strength <= -20:
+                final_signal = "بيع قوي 🔴"
+            elif signal_strength <= -10:
+                final_signal = "بيع 🔴"
+            else:
+                final_signal = "محايد ⚪"
+            
+            # حساب الهدف ووقف الخسارة
+            atr_value = current['ATR'] if not pd.isna(current['ATR']) else data['Close'].std() * 0.01
+            
+            result = {
+                'symbol': symbol,
+                'timestamp': datetime.now(),
+                'signal': final_signal,
+                'signal_strength': signal_strength,
+                'current_price': round(current['Close'], 4),
+                'rsi': round(current['RSI'], 2),
+                'macd': round(current['MACD'], 4),
+                'sma_9': round(current['SMA_9'], 4),
+                'sma_21': round(current['SMA_21'], 4),
+                'atr': round(atr_value, 4),
+                'confidence_reasons': confidence_reasons,
+                'take_profit': round(current['Close'] + (2 * atr_value), 4) if signal_strength > 0 else round(current['Close'] - (2 * atr_value), 4),
+                'stop_loss': round(current['Close'] - (1.5 * atr_value), 4) if signal_strength > 0 else round(current['Close'] + (1.5 * atr_value), 4),
+                'timeframe': timeframe
+            }
+            
+            self.signals_history.append(result)
+            return result
+            
+        except Exception as e:
+            print(f"Error in analysis: {e}")
+            return None
+
+def send_email_alert(signal_data):
+    """إرسال تنبيه بالإيميل"""
+    try:
+        # التحقق من إعدادات الإيميل
+        if not EMAIL_CONFIG['sender_email'] or not EMAIL_CONFIG['sender_password']:
+            print("❌ إعدادات الإيميل غير مكتملة")
+            return False
+            
+        msg = MimeMultipart()
+        msg['From'] = EMAIL_CONFIG['sender_email']
+        msg['To'] = EMAIL_CONFIG['receiver_email']
+        msg['Subject'] = f"📈 تنبيه تداول: {signal_data['signal']} - {signal_data['symbol']}"
+        
+        # بناء محتوى الإيميل
+        body = f"""
+        🚀 إشارة تداول جديدة 🚀
+        
+        الزوج: {signal_data['symbol']}
+        الوقت: {signal_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}
+        الإطار الزمني: {signal_data['timeframe']}
+        
+        📊 الإشارة: {signal_data['signal']}
+        قوة الإشارة: {signal_data['signal_strength']}
+        
+        💰 السعر الحالي: {signal_data['current_price']}
+        🎯 هدف الربح: {signal_data['take_profit']}
+        🛑 وقف الخسارة: {signal_data['stop_loss']}
+        
+        📈 المؤشرات:
+        - RSI: {signal_data['rsi']}
+        - MACD: {signal_data['macd']}
+        - SMA 9: {signal_data['sma_9']}
+        - SMA 21: {signal_data['sma_21']}
+        - ATR: {signal_data['atr']}
+        
+        📋 أسباب الثقة:
+        {chr(10).join(['• ' + reason for reason in signal_data['confidence_reasons']])}
+        
+        ⚠️ تنبيه: هذه ليست نصيحة مالية، قم بإجراء بحثك الخاص.
+        """
+        
+        msg.attach(MimeText(body, 'plain'))
+        
+        server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
+        server.starttls()
+        server.login(EMAIL_CONFIG['sender_email'], EMAIL_CONFIG['sender_password'])
+        server.send_message(msg)
+        server.quit()
+        
+        print("✅ تم إرسال الإيميل بنجاح")
+        return True
+    except Exception as e:
+        print(f"❌ خطأ في إرسال الإيميل: {e}")
+        return False
+
+# إنشاء الكائن الرئيسي
+trading_bot = AdvancedTradingSignals()
+
+def check_signals_and_alert():
+    """فحص الإشارات وإرسال التنبيهات"""
+    symbols = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "BTC-USD", "ETH-USD"]
+    
+    for symbol in symbols:
+        print(f"🔍 تحليل {symbol}...")
+        signal = trading_bot.analyze_signals(symbol, "60m")
+        
+        if signal and abs(signal['signal_strength']) >= 15:  # إرسال فقط الإشارات القوية
+            print(f"🎯 إشارة قوية لـ {symbol}: {signal['signal']}")
+            send_email_alert(signal)
+        elif signal:
+            print(f"⚪ إشارة عادية لـ {symbol}: {signal['signal']}")
+        time.sleep(2)  # تجنب rate limits
+
+@app.route('/')
+def home():
+    return "🤖 بوت التداول يعمل! تتبع الإيميلات للتنبيهات."
+
+@app.route('/check-now')
+def check_now():
+    """فحص يدوي"""
+    check_signals_and_alert()
+    return "تم الفحص وإرسال التنبيهات إذا وجدت إشارات قوية"
+
+if __name__ == '__main__':
+    # جدولة الفحص كل ساعة
+    schedule.every(1).hours.do(check_signals_and_alert)
+    
+    # فحص أولي عند التشغيل
+    check_signals_and_alert()
+    
+    print("🚀 بوت التداول يعمل...")
+    
+    # تشغيل السيرفر
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+    
+    # استمرار الجدولة
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
