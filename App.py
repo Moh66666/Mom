@@ -1,276 +1,343 @@
-import os
-import smtplib
-import schedule
-import time
-from datetime import datetime
-from email.mime.text import MimeText
-from email.mime.multipart import MimeMultipart
+import requests
 import pandas as pd
+import smtplib
 import numpy as np
-import yfinance as yf
+from email.mime.text import MIMEText
+from datetime import datetime, timedelta
+import time
+import os
 import ta
-from flask import Flask
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+import joblib
 
-app = Flask(__name__)
+# -----------------------------
+# إعدادات API
+API_KEY = "qT9W9kW3aYOSEeEsK92PpX"
+BASE_URL = "https://fcsapi.com/api-v3/forex/history"
 
-# إعدادات الإيميل (سيتم تعيينها في Render)
-EMAIL_CONFIG = {
-    'smtp_server': 'smtp.gmail.com',
-    'smtp_port': 587,
-    'sender_email': os.environ.get('EMAIL_SENDER', ''),
-    'sender_password': os.environ.get('EMAIL_PASSWORD', ''),
-    'receiver_email': os.environ.get('EMAIL_RECEIVER', '')
+# -----------------------------
+# إعدادات البريد
+EMAIL_FROM = os.getenv('EMAIL_FROM', 'gptmoh5@gmail.com')
+EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', '')
+EMAIL_TO = os.getenv('EMAIL_TO', 'gptmoh5@gmail.com')
+
+# -----------------------------
+# إعدادات التداول
+SYMBOL = "EUR/USD"
+TIMEFRAMES = {
+    "1m": {"candles": 100, "weight": 1.0, "prediction_count": 5},
+    "5m": {"candles": 120, "weight": 1.2, "prediction_count": 3},
+    "15m": {"candles": 100, "weight": 1.4, "prediction_count": 2},
+    "30m": {"candles": 80, "weight": 1.5, "prediction_count": 2},
+    "1h": {"candles": 60, "weight": 1.6, "prediction_count": 2},
+    "4h": {"candles": 40, "weight": 1.8, "prediction_count": 1}
 }
 
-class AdvancedTradingSignals:
-    def __init__(self):
-        self.signals_history = []
-    
-    def calculate_indicators(self, df):
-        """حساب جميع المؤشرات الفنية"""
-        # المتوسطات المتحركة
-        df['SMA_9'] = ta.trend.sma_indicator(df['Close'], window=9)
-        df['SMA_21'] = ta.trend.sma_indicator(df['Close'], window=21)
-        df['EMA_12'] = ta.trend.ema_indicator(df['Close'], window=12)
-        df['EMA_26'] = ta.trend.ema_indicator(df['Close'], window=26)
+# -----------------------------
+# دالة جلب البيانات التاريخية
+def get_historical_data(symbol, timeframe, count):
+    try:
+        url = f"{BASE_URL}?symbol={symbol}&period={timeframe}&access_key={API_KEY}"
+        response = requests.get(url, timeout=10)
+        data = response.json()
         
-        # RSI بمستويات متعددة
-        df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
-        df['RSI_7'] = ta.momentum.rsi(df['Close'], window=7)
+        if data.get('status') == True:
+            candles = data['response']
+            df = pd.DataFrame(candles)
+            df['t'] = pd.to_datetime(df['t'])
+            df = df.rename(columns={
+                'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'
+            })
+            df = df[['t', 'open', 'high', 'low', 'close', 'volume']]
+            return df.tail(count)
+        return None
+    except Exception as e:
+        print(f"خطأ في جلب البيانات: {e}")
+        return None
+
+# -----------------------------
+# دالة حساب المؤشرات الفنية للتنبؤ
+def calculate_prediction_features(df):
+    try:
+        # المتوسطات المتحركة
+        df['sma_5'] = ta.trend.SMAIndicator(df['close'], window=5).sma_indicator()
+        df['sma_10'] = ta.trend.SMAIndicator(df['close'], window=10).sma_indicator()
+        df['ema_8'] = ta.trend.EMAIndicator(df['close'], window=8).ema_indicator()
+        df['ema_21'] = ta.trend.EMAIndicator(df['close'], window=21).ema_indicator()
+        
+        # RSI متعدد
+        df['rsi_6'] = ta.momentum.RSIIndicator(df['close'], window=6).rsi()
+        df['rsi_14'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
         
         # MACD
-        macd = ta.trend.MACD(df['Close'])
-        df['MACD'] = macd.macd()
-        df['MACD_Signal'] = macd.macd_signal()
-        df['MACD_Histogram'] = macd.macd_diff()
-        
-        # Bollinger Bands
-        bollinger = ta.volatility.BollingerBands(df['Close'])
-        df['BB_Upper'] = bollinger.bollinger_hband()
-        df['BB_Lower'] = bollinger.bollinger_lband()
-        df['BB_Middle'] = bollinger.bollinger_mavg()
-        
-        # ATR
-        df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'])
-        
-        # Volume indicators
-        df['Volume_SMA'] = df['Volume'].rolling(20).mean()
+        macd = ta.trend.MACD(df['close'])
+        df['macd'] = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['macd_hist'] = macd.macd_diff()
         
         # Stochastic
-        stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'])
-        df['Stoch_K'] = stoch.stoch()
-        df['Stoch_D'] = stoch.stoch_signal()
+        stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close'])
+        df['stoch_k'] = stoch.stoch()
+        df['stoch_d'] = stoch.stoch_signal()
+        
+        # Bollinger Bands
+        bb = ta.volatility.BollingerBands(df['close'], window=20)
+        df['bb_upper'] = bb.bollinger_hband()
+        df['bb_lower'] = bb.bollinger_lband()
+        df['bb_middle'] = bb.bollinger_mavg()
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+        
+        # الاتجاه والقوة
+        df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close']).adx()
+        df['momentum'] = ta.momentum.ROCIndicator(df['close'], window=5).roc()
+        
+        # أنماط الشموع
+        df['body'] = abs(df['close'] - df['open'])
+        df['upper_shadow'] = df['high'] - np.maximum(df['open'], df['close'])
+        df['lower_shadow'] = np.minimum(df['open'], df['close']) - df['low']
+        df['body_ratio'] = df['body'] / (df['high'] - df['low'])
+        
+        # حجم التداول النسبي
+        df['volume_sma'] = df['volume'].rolling(10).mean()
+        df['volume_ratio'] = df['volume'] / df['volume_sma']
         
         return df
-    
-    def analyze_signals(self, symbol="EURUSD=X", timeframe="60m"):
-        """تحليل متعدد الأبعاد للإشارات"""
-        try:
-            # جلب البيانات
-            data = yf.download(symbol, period="1mo", interval=timeframe, progress=False)
-            if data.empty:
-                return None
-            
-            df = self.calculate_indicators(data)
-            current = df.iloc[-1]
-            previous = df.iloc[-2]
-            
-            signal_strength = 0
-            confidence_reasons = []
-            
-            # 1. تحليل المتوسطات المتحركة (وزن 30%)
-            ma_signals = []
-            if current['SMA_9'] > current['SMA_21'] and previous['SMA_9'] <= previous['SMA_21']:
-                ma_signals.append("SMA 9 عبر فوق SMA 21")
-                signal_strength += 15
-            elif current['SMA_9'] < current['SMA_21'] and previous['SMA_9'] >= previous['SMA_21']:
-                ma_signals.append("SMA 9 عبر تحت SMA 21")
-                signal_strength -= 15
-            
-            if current['EMA_12'] > current['EMA_26']:
-                ma_signals.append("EMA 12 فوق EMA 26")
-                signal_strength += 10
-            else:
-                ma_signals.append("EMA 12 تحت EMA 26")
-                signal_strength -= 10
-            
-            if ma_signals:
-                confidence_reasons.extend(ma_signals)
-            
-            # 2. تحليل RSI (وزن 25%)
-            rsi_signals = []
-            if current['RSI'] < 30:
-                rsi_signals.append("RSI في منطقة ذروة البيع (<30)")
-                signal_strength += 20
-            elif current['RSI'] > 70:
-                rsi_signals.append("RSI في منطقة ذروة الشراء (>70)")
-                signal_strength -= 20
-            elif 40 < current['RSI'] < 60:
-                rsi_signals.append("RSI في منطقة محايدة")
-            
-            if rsi_signals:
-                confidence_reasons.extend(rsi_signals)
-            
-            # 3. تحليل MACD (وزن 20%)
-            if current['MACD'] > current['MACD_Signal'] and previous['MACD'] <= previous['MACD_Signal']:
-                confidence_reasons.append("MACD إيجابي")
-                signal_strength += 10
-            elif current['MACD'] < current['MACD_Signal'] and previous['MACD'] >= previous['MACD_Signal']:
-                confidence_reasons.append("MACD سلبي")
-                signal_strength -= 10
-            
-            # 4. تحليل البولينجر باند (وزن 15%)
-            if current['Close'] < current['BB_Lower']:
-                confidence_reasons.append("السعر تحت البولينجر السفلي (ذروة بيع)")
-                signal_strength += 8
-            elif current['Close'] > current['BB_Upper']:
-                confidence_reasons.append("السعر فوق البولينجر العلوي (ذروة شراء)")
-                signal_strength -= 8
-            
-            # 5. تحليل الاستوكاستك (وزن 10%)
-            if current['Stoch_K'] < 20 and current['Stoch_D'] < 20:
-                confidence_reasons.append("الاستوكاستك في منطقة ذروة البيع")
-                signal_strength += 5
-            elif current['Stoch_K'] > 80 and current['Stoch_D'] > 80:
-                confidence_reasons.append("الاستوكاستك في منطقة ذروة الشراء")
-                signal_strength -= 5
-            
-            # تحديد الإشارة النهائية
-            if signal_strength >= 20:
-                final_signal = "شراء قوي 🟢"
-            elif signal_strength >= 10:
-                final_signal = "شراء 🟢"
-            elif signal_strength <= -20:
-                final_signal = "بيع قوي 🔴"
-            elif signal_strength <= -10:
-                final_signal = "بيع 🔴"
-            else:
-                final_signal = "محايد ⚪"
-            
-            # حساب الهدف ووقف الخسارة
-            atr_value = current['ATR'] if not pd.isna(current['ATR']) else data['Close'].std() * 0.01
-            
-            result = {
-                'symbol': symbol,
-                'timestamp': datetime.now(),
-                'signal': final_signal,
-                'signal_strength': signal_strength,
-                'current_price': round(current['Close'], 4),
-                'rsi': round(current['RSI'], 2),
-                'macd': round(current['MACD'], 4),
-                'sma_9': round(current['SMA_9'], 4),
-                'sma_21': round(current['SMA_21'], 4),
-                'atr': round(atr_value, 4),
-                'confidence_reasons': confidence_reasons,
-                'take_profit': round(current['Close'] + (2 * atr_value), 4) if signal_strength > 0 else round(current['Close'] - (2 * atr_value), 4),
-                'stop_loss': round(current['Close'] - (1.5 * atr_value), 4) if signal_strength > 0 else round(current['Close'] + (1.5 * atr_value), 4),
-                'timeframe': timeframe
-            }
-            
-            self.signals_history.append(result)
-            return result
-            
-        except Exception as e:
-            print(f"Error in analysis: {e}")
-            return None
-
-def send_email_alert(signal_data):
-    """إرسال تنبيه بالإيميل"""
-    try:
-        # التحقق من إعدادات الإيميل
-        if not EMAIL_CONFIG['sender_email'] or not EMAIL_CONFIG['sender_password']:
-            print("❌ إعدادات الإيميل غير مكتملة")
-            return False
-            
-        msg = MimeMultipart()
-        msg['From'] = EMAIL_CONFIG['sender_email']
-        msg['To'] = EMAIL_CONFIG['receiver_email']
-        msg['Subject'] = f"📈 تنبيه تداول: {signal_data['signal']} - {signal_data['symbol']}"
-        
-        # بناء محتوى الإيميل
-        body = f"""
-        🚀 إشارة تداول جديدة 🚀
-        
-        الزوج: {signal_data['symbol']}
-        الوقت: {signal_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}
-        الإطار الزمني: {signal_data['timeframe']}
-        
-        📊 الإشارة: {signal_data['signal']}
-        قوة الإشارة: {signal_data['signal_strength']}
-        
-        💰 السعر الحالي: {signal_data['current_price']}
-        🎯 هدف الربح: {signal_data['take_profit']}
-        🛑 وقف الخسارة: {signal_data['stop_loss']}
-        
-        📈 المؤشرات:
-        - RSI: {signal_data['rsi']}
-        - MACD: {signal_data['macd']}
-        - SMA 9: {signal_data['sma_9']}
-        - SMA 21: {signal_data['sma_21']}
-        - ATR: {signal_data['atr']}
-        
-        📋 أسباب الثقة:
-        {chr(10).join(['• ' + reason for reason in signal_data['confidence_reasons']])}
-        
-        ⚠️ تنبيه: هذه ليست نصيحة مالية، قم بإجراء بحثك الخاص.
-        """
-        
-        msg.attach(MimeText(body, 'plain'))
-        
-        server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
-        server.starttls()
-        server.login(EMAIL_CONFIG['sender_email'], EMAIL_CONFIG['sender_password'])
-        server.send_message(msg)
-        server.quit()
-        
-        print("✅ تم إرسال الإيميل بنجاح")
-        return True
     except Exception as e:
-        print(f"❌ خطأ في إرسال الإيميل: {e}")
+        print(f"خطأ في حساب المؤشرات: {e}")
+        return df
+
+# -----------------------------
+# دالة التنبؤ بالشموع القادمة
+def predict_next_candles(df, timeframe, prediction_count):
+    try:
+        # إعداد البيانات للتدريب
+        features_df = calculate_prediction_features(df)
+        
+        # إنشاء الهدف (الاتجاه للشمعة التالية)
+        features_df['next_close'] = features_df['close'].shift(-1)
+        features_df['target'] = np.where(
+            features_df['next_close'] > features_df['close'], 1, 0  # 1: صاعد, 0:هابط
+        )
+        
+        # إعداد الميزات
+        feature_columns = [
+            'sma_5', 'sma_10', 'ema_8', 'ema_21', 'rsi_6', 'rsi_14',
+            'macd', 'macd_signal', 'macd_hist', 'stoch_k', 'stoch_d',
+            'bb_width', 'adx', 'momentum', 'body_ratio', 'volume_ratio'
+        ]
+        
+        # تنظيف البيانات
+        features_df = features_df.dropna()
+        
+        if len(features_df) < 30:
+            return []
+        
+        X = features_df[feature_columns].values
+        y = features_df['target'].values
+        
+        # تدريب النموذج
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        model.fit(X, y)
+        
+        # التنبؤ بالشموع القادمة
+        predictions = []
+        current_features = X[-1:].copy()
+        
+        for i in range(prediction_count):
+            pred = model.predict(current_features)[0]
+            proba = model.predict_proba(current_features)[0]
+            confidence = max(proba) * 100
+            
+            predictions.append({
+                'candle_number': i + 1,
+                'direction': '🟢 صاعد' if pred == 1 else '🔴 هابط',
+                'confidence': confidence,
+                'timeframe': timeframe
+            })
+            
+            # تحديث الميزات للتنبؤ التالي (محاكاة)
+            if i < prediction_count - 1:
+                current_features[0][0] *= 1.001 if pred == 1 else 0.999  # تحديث SMA
+                current_features[0][4] = min(100, current_features[0][4] * 1.01) if pred == 1 else max(0, current_features[0][4] * 0.99)  # RSI
+        
+        return predictions
+        
+    except Exception as e:
+        print(f"خطأ في التنبؤ: {e}")
+        return []
+
+# -----------------------------
+# دالة تحليل الاتجاه الحالي
+def analyze_current_trend(df, timeframe):
+    try:
+        current = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        # اتجاه قصير المدى (آخر 5 شموع)
+        short_trend = "صاعد" if current['close'] > df['close'].iloc[-5] else "هابط"
+        
+        # اتجاه المتوسطات
+        ma_trend = "صاعد" if current['sma_5'] > current['sma_10'] else "هابط"
+        
+        # قوة الاتجاه
+        trend_strength = "قوي" if current['adx'] > 25 else "متوسط" if current['adx'] > 20 else "ضعيف"
+        
+        # حالة RSI
+        rsi_status = "شراء مفرط" if current['rsi_14'] > 70 else "بيع مفرط" if current['rsi_14'] < 30 else "محايد"
+        
+        return {
+            'timeframe': timeframe,
+            'short_trend': short_trend,
+            'ma_trend': ma_trend,
+            'trend_strength': trend_strength,
+            'rsi_status': rsi_status,
+            'current_price': current['close'],
+            'timestamp': datetime.now().strftime("%H:%M:%S")
+        }
+    except Exception as e:
+        print(f"خطأ في تحليل الاتجاه: {e}")
+        return None
+
+# -----------------------------
+# دالة إرسال تقرير الشموع المتوقع
+def send_candle_prediction_report(symbol, trend_analysis, predictions):
+    try:
+        subject = f"📊 توقعات الشموع القادمة - {symbol} - {datetime.now().strftime('%H:%M')}"
+        
+        # بناء التقرير
+        report = f"""
+🎯 **تقرير توقعات الشموع القادمة**
+────────────────────
+📈 الزوج: {symbol}
+🕐 وقت التحديث: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+📊 **الاتجاهات الحالية:**
+"""
+        
+        # إضافة تحليل كل timeframe
+        for analysis in trend_analysis:
+            if analysis:
+                report += f"""
+⏰ **{analysis['timeframe']}:**
+   • الاتجاه القصير: {analysis['short_trend']}
+   • اتجاه المتوسطات: {analysis['ma_trend']}
+   • قوة الاتجاه: {analysis['trend_strength']}
+   • حالة RSI: {analysis['rsi_status']}
+   • السعر: {analysis['current_price']:.5f}
+"""
+        
+        report += f"\n🔮 **توقعات الشموع القادمة:**\n"
+        
+        # إضافة تنبؤات كل timeframe
+        for pred in predictions:
+            if pred:
+                report += f"\n⏰ **{pred['timeframe']}:**\n"
+                for candle_pred in pred['predictions']:
+                    report += f"   • الشمعة {candle_pred['candle_number']}: {candle_pred['direction']} (ثقة: {candle_pred['confidence']:.1f}%)\n"
+        
+        report += """
+────────────────────
+💡 **توجيهات استراتيجية:**
+• استخدم التوقعات كدعم لاتخاذ القرار
+• الجمع بين multiple timeframes يزيد الدقة
+• دائماً استخدم Stop Loss
+
+📧 نظام التوقعات الذكي - بركة الله في تجارتك
+"""
+        
+        msg = MIMEText(report, 'plain', 'utf-8')
+        msg['Subject'] = subject
+        msg['From'] = EMAIL_FROM
+        msg['To'] = EMAIL_TO
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        
+        print(f"✅ تم إرسال تقرير التوقعات")
+        return True
+        
+    except Exception as e:
+        print(f"❌ خطأ في إرسال التقرير: {e}")
         return False
 
-# إنشاء الكائن الرئيسي
-trading_bot = AdvancedTradingSignals()
-
-def check_signals_and_alert():
-    """فحص الإشارات وإرسال التنبيهات"""
-    symbols = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "BTC-USD", "ETH-USD"]
+# -----------------------------
+# الدالة الرئيسية للتوقعات
+def run_candle_prediction_analysis():
+    print(f"\n🔮 بدء تحليل توقعات الشموع لـ {SYMBOL} - {datetime.now()}")
     
-    for symbol in symbols:
-        print(f"🔍 تحليل {symbol}...")
-        signal = trading_bot.analyze_signals(symbol, "60m")
+    all_trend_analysis = []
+    all_predictions = []
+    
+    for timeframe, config in TIMEFRAMES.items():
+        try:
+            print(f"   ⏳ جاري تحليل {timeframe}...")
+            
+            # جلب البيانات
+            df = get_historical_data(SYMBOL, timeframe, config['candles'])
+            if df is None or len(df) < 30:
+                continue
+            
+            # حساب المؤشرات
+            df = calculate_prediction_features(df)
+            df = df.dropna()
+            
+            if len(df) < 20:
+                continue
+            
+            # تحليل الاتجاه الحالي
+            trend_analysis = analyze_current_trend(df, timeframe)
+            if trend_analysis:
+                all_trend_analysis.append(trend_analysis)
+            
+            # التنبؤ بالشموع القادمة
+            predictions = predict_next_candles(df, timeframe, config['prediction_count'])
+            if predictions:
+                all_predictions.append({
+                    'timeframe': timeframe,
+                    'predictions': predictions
+                })
+            
+            print(f"   ✅ تم تحليل {timeframe}: {len(predictions)} توقعات")
+            
+        except Exception as e:
+            print(f"   ❌ خطأ في {timeframe}: {e}")
+    
+    # إرسال التقرير كل 15 دقيقة أو عندما تكون هناك تغييرات كبيرة
+    if all_predictions and all_trend_analysis:
+        send_candle_prediction_report(SYMBOL, all_trend_analysis, all_predictions)
+        return True
+    
+    return False
+
+# -----------------------------
+# الحلقة الرئيسية
+print("🚀 بدء نظام توقعات الشموع - بإذن الله توقعات دقيقة")
+print("⏰ سيتم تحديث التوقعات كل دقيقة وإرسال التقارير كل 15 دقيقة")
+
+last_report_time = datetime.now()
+report_interval = 15  # دقائق
+
+while True:
+    try:
+        current_time = datetime.now()
         
-        if signal and abs(signal['signal_strength']) >= 15:  # إرسال فقط الإشارات القوية
-            print(f"🎯 إشارة قوية لـ {symbol}: {signal['signal']}")
-            send_email_alert(signal)
-        elif signal:
-            print(f"⚪ إشارة عادية لـ {symbol}: {signal['signal']}")
-        time.sleep(2)  # تجنب rate limits
-
-@app.route('/')
-def home():
-    return "🤖 بوت التداول يعمل! تتبع الإيميلات للتنبيهات."
-
-@app.route('/check-now')
-def check_now():
-    """فحص يدوي"""
-    check_signals_and_alert()
-    return "تم الفحص وإرسال التنبيهات إذا وجدت إشارات قوية"
-
-if __name__ == '__main__':
-    # جدولة الفحص كل ساعة
-    schedule.every(1).hours.do(check_signals_and_alert)
-    
-    # فحص أولي عند التشغيل
-    check_signals_and_alert()
-    
-    print("🚀 بوت التداول يعمل...")
-    
-    # تشغيل السيرفر
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
-    
-    # استمرار الجدولة
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+        # تشغيل التحليل كل دقيقة
+        run_candle_prediction_analysis()
+        
+        # إرسال تقرير مفصل كل 15 دقيقة
+        if (current_time - last_report_time).total_seconds() >= report_interval * 60:
+            print(f"\n📨 إرسال التقرير الدوري كل {report_interval} دقيقة")
+            run_candle_prediction_analysis()
+            last_report_time = current_time
+        
+        print(f"⏳ انتظار دقيقة للتحديث التالي... ({current_time.strftime('%H:%M:%S')})")
+        time.sleep(60)
+        
+    except KeyboardInterrupt:
+        print("\n⏹️ تم إيقاف نظام التوقعات - بارك الله فيك")
+        break
+    except Exception as e:
+        print(f"🔥 خطأ غير متوقع: {e}")
+        time.sleep(60)
